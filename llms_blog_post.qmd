@@ -1,0 +1,134 @@
+---
+title: "Using Large Language Models to generate political regime datasets: An update"
+author:
+- name: "[Xavier Márquez](https://people.wgtn.ac.nz/xavier.marquez)"
+  affiliation: Victoria University of Wellington
+  orcid: 0000-0001-7653-9334
+format: html
+
+date: "31 October 2024"
+date-modified: last-modified
+date-format: "DD MMMM YYYY"
+toc: true
+message: false
+warning: false
+bibliography: "bibliography.bib"
+---
+
+[Last year](https://xmarquez.github.io/GPTDemocracyIndex/GPTDemocracyIndex.html), I used [OpenAI's GPT3.5](https://chat.openai.com/)  and [Anthropic's Claude 2.1](https://www.anthropic.com/index/introducing-claude) to generate democracy scores with a prompt based on the polyarchy variable of [V-Dem](https://www.v-dem.net/documents/24/codebook_v13.pdf#page=45). It's been a while, and models have become better at a lot of tasks: are they any better at generating democracy scores, or other sorts of political regime data? TL;DR: yes they are. The details are interesting.
+
+This time I tested 11 different models, ranging from the top proprietary models (Gemini Pro 1.5, Claude Sonnet 3.5, and GPT-4o) to the slimmer and faster versions of these models (Gemini Flash 1.5, Claude Haiku, GPT-4o mini) to a number of open weights models (llama3-8b, llama3-70b. llama-3.1-8b-instant, mixtral-8x7b-32768, gemma2-9b-it, all via the [groq API](https://console.groq.com/)). I also developed an R package to help me access a variety of models form R ({R.AI} - github repo here; I know, this is easier in Python, but I'm an R person).
+
+```{r setup}
+library(targets)
+library(tidyverse)
+library(democracyData)
+library(corrr)
+library(R.AI)
+theme_set(theme_bw())
+
+tar_load(correlations)
+tar_load(combined_responses)
+tar_load(combined_responses_wide)
+tar_load(combined_responses_summary)
+tar_load(estimated_costs)
+
+```
+
+I used large sample of the latest version of the V-Dem dataset, going all the way back to the 18th century; I sampled uniformly 2,000 country-years from it. 
+
+I used a very simple prompt, based on the V-Dem description of [the principle of electoral democracy](https://v-dem.net/documents/38/V-Dem_Codebook_v14.pdf#page=47.22):
+
+> You are an AI with superhuman knowledge of the politics of {country} and you help political scientists create detailed evaluations of its political regime.
+
+> The electoral principle of democracy seeks to embody the core value of making rulers responsive to citizens, achieved through electoral competition for the electorate’s approval under circumstances when suffrage is extensive; political and civil society organizations can operate freely; elections are clean and not marred by fraud or systematic irregularities; and elections affect the composition of the chief executive of the country. In between elections, there is freedom of expression and an independent media capable of presenting alternative views on matters of political relevance.
+
+> To what extent is the ideal of electoral democracy in its fullest sense achieved in {country} during the year {year}?
+
+> Use only knowledge relevant to {country} during the year {year}. Your final answer should be a single number on a scale of 0 to 1, with 0 being not democratic at all and 1 being fully democratic, enclosed in <democracy></democracy> tags. Before answering, consider in detail the degree of electoral competition, the extent of the suffrage, the ability of civil society organizations to operate freely, the fairness of elections, the degree to which the composition of the chief executive of the country is affected by the results of the elections, the ability of citizens to express themselves, and the degree to which independent media exists. Make sure to include concrete examples, and explain the reasoning for your final score.
+
+This simple prompt was surprisingly effective; the generated data is typically correlated at the 0.9 level and above, which is on a par with the correlations between existing democracy datasets (@tbl-correlations), and larger models are better correlated (Llama 70B correlates at 0.94, and GPT-4o at 0.96).
+
+```{r correlations}
+#| label: tbl-correlations
+#| tbl-cap: "Correlations between generated democracy scores and V-Dem democracy data"
+
+correlations[[1]] |>
+  as_tibble(rownames = "score") |>
+  knitr::kable(digits = 2)
+
+```
+
+More interestingly, the averaged scores are better correlated with V-Dem than the individual scores, suggesting that model errors "cancel out"; the *average* correlation is 0.95, which is higher than the correlation of any individual model's generated scores with the V-Dem polyarchy index.
+
+```{r correlations-averaged}
+#| label: tbl-correlations-averaged
+#| tbl-cap: "Correlations between averaged generated democracy scores and V-Dem democracy data"
+
+combined_responses_summary |>
+  select(v2x_polyarchy, Mean) |>
+  set_names(c("v2x_polyarchy", "avg. of generated scores")) |>
+  corrr::correlate() |>
+  knitr::kable(digits = 2)
+```
+
+The models varied quite a bit, however, in how far away they were from the V-Dem scores (@fig-mae-model), though they were rarely much beyond 0.1 in absolute error; the median absolute deviation was 0.07 (remember, the V-Dem scores are on a 0-1 scale; an absolute error of less than 0.1 is pretty good!). The larger models (e.g., Llama3-70b) were typically closer to the V-Dem scores than the smaller models, though Google's Gemma2 9B model did surprisingly well. One explanation here is that the larger models have memorized more of the V-Dem data; more on this in a bit.  
+
+```{r mae-model}
+#| label: fig-mae-model
+#| fig-cap: "Average absolute error per model, relative to V-Dem polyarchy scores"
+
+library(ggbeeswarm) 
+combined_responses |>
+  filter(!is.na(score)) |>
+  group_by(model) |>
+  mutate(mae = abs(v2x_polyarchy-score)) |>
+  arrange(mae) |>
+  ggplot(aes(x = mae, y = fct_reorder(model, mae, mean))) +
+  geom_beeswarm(aes(color = model), alpha = 0.3, show.legend = FALSE) +
+  stat_summary() +
+  geom_boxplot(alpha = 0.3) +
+  scale_color_viridis_d() +
+  geom_vline(xintercept = 0.1, color = "red") +
+  labs(y = "", x = "Absolute deviation from V-dem polyarchy scores")
+
+```
+Performance also varied per year, though without a clear pattern; earlier years are not consistently more "erroneously" classified by any models than later years or vice-versa (@fig-mae-year).
+
+```{r mae-year}
+#| label: fig-mae-year
+#| fig-cap: "Average error per year, relative to V-Dem polyarchy scores, per model"
+ 
+combined_responses |>
+  filter(!is.na(score)) |>
+  mutate(ae = abs(v2x_polyarchy-score)) |>
+  ggplot(aes(y = ae, x = year)) +
+  stat_summary(aes(color = model), alpha = 0.3) +
+  stat_summary() +
+  geom_smooth() +
+  scale_color_viridis_d() +
+  labs(x = "", y = "Mean absolute error (MAE)")
+
+```
+
+And performance also varied per country, though again without a clear pattern (@fig-mae-country); while the country with the largest deviation from V-Dem scores was the Duchy of Hanover in the 19th century, the next couple of countries are Ukraine and Australia.
+
+```{r mae-year}
+#| label: fig-mae-country
+#| fig-cap: "Average error per country, relative to V-Dem polyarchy scores, per model"
+
+ 
+combined_responses |>
+  filter(!is.na(score)) |>
+  group_by(country, model) |>
+  mutate(ae = abs(v2x_polyarchy-score)) |>
+  ggplot(aes(x = ae, y = fct_reorder(country, ae, mean))) +
+  stat_summary(aes(color = model), alpha = 0.3) +
+  stat_summary() +
+  scale_color_viridis_d() +
+  labs(y = "", x = "Mean absolute error (MAE)")
+
+```
+
+Here are the responses for Australia (@tbl-responses-australia)
+
