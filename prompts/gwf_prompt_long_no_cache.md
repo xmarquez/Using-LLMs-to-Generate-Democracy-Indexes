@@ -1,0 +1,1 @@
+For {country} during the year {year}, what is the value of all of these variables? Use only information relevant to the year {year} or to relevant events of previous years, not to later years. Reply only with the appropriate JSON structure.
